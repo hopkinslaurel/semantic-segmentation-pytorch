@@ -146,6 +146,13 @@ class ModelBuilder:
                 fc_dim=fc_dim,
                 use_softmax=use_softmax,
                 fpn_dim=512)
+
+        # Classification models, not technically decoders
+        elif arch == 'ppm_classification':
+            net_decoder = PPM_classification(
+                num_class=num_class,
+                fc_dim=fc_dim,
+                use_softmax=use_softmax)
         else:
             raise Exception('Architecture undefined!')
 
@@ -416,11 +423,13 @@ class PPM(nn.Module):
 
         input_size = conv5.size()
         ppm_out = [conv5]
+
         for pool_scale in self.ppm:
             ppm_out.append(nn.functional.interpolate(
                 pool_scale(conv5),
                 (input_size[2], input_size[3]),
                 mode='bilinear', align_corners=False))
+
         ppm_out = torch.cat(ppm_out, 1)
 
         x = self.conv_last(ppm_out)
@@ -430,7 +439,7 @@ class PPM(nn.Module):
                 x, size=segSize, mode='bilinear', align_corners=False)
             x = nn.functional.softmax(x, dim=1)
         else:
-            x = nn.functional.log_softmax(x, dim=1)
+            x = nn.functional.log_softmax(x, dim=1)  # transforms tensor to be in range [-inf, 0)
         return x
 
 
@@ -468,11 +477,13 @@ class PPMDeepsup(nn.Module):
 
         input_size = conv5.size()
         ppm_out = [conv5]
+
         for pool_scale in self.ppm:
             ppm_out.append(nn.functional.interpolate(
                 pool_scale(conv5),
                 (input_size[2], input_size[3]),
                 mode='bilinear', align_corners=False))
+
         ppm_out = torch.cat(ppm_out, 1)
 
         x = self.conv_last(ppm_out)
@@ -583,4 +594,82 @@ class UPerNet(nn.Module):
 
         x = nn.functional.log_softmax(x, dim=1)
 
+        return x
+
+
+# Classification "decoders"
+# PPM with classification
+class PPM_classification(nn.Module):
+    def __init__(self, num_class=150, fc_dim=4096,
+                 use_softmax=False, pool_scales=(1, 2, 3, 6)):
+        super(PPM, self).__init__()
+        self.use_softmax = use_softmax
+
+        self.ppm = []
+        for scale in pool_scales:
+            self.ppm.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(scale),
+                nn.Conv2d(fc_dim, 512, kernel_size=1, bias=False),
+                BatchNorm2d(512),
+                nn.ReLU(inplace=True)
+            ))
+        self.ppm = nn.ModuleList(self.ppm)
+
+        print("pool_scales:")
+        print(pool_scales)
+        pp_features = [scale*512 for scale in pool_scales]
+        print(pp_features)
+        pp_features = np.sum(pp_features)
+        print(pp_features)
+        print(car)
+
+        # 1: fully connected composed of only the pyramid pooing layers, this is similar to Spatial
+        #    Pyramid Pooling in Deep Convolutional Networks for Visual Recognition (page 3)
+        if SPP:
+            self.conv_last = nn.Sequential(
+                nn.Linear(pp_features, 512),
+                BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+            )
+
+        # 2: conv feature maps AND upsampled pyramid pooing layers, this is similar to Pyramid Scene Parsing Network
+        else:
+            self.conv_last = nn.Sequential(
+                nn.Conv2d(fc_dim + len(pool_scales) * 512, 512,
+                          kernel_size=3, padding=1, bias=False),
+                BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Conv2d(512, num_class, kernel_size=1),  #TODO: experiment with removing this last convolution
+                nn.Linear(4096 , num_class)  #TODO: 4096 is not correct, this will need to be tuned
+            )
+
+    def forward(self, conv_out, segSize=None):
+        if SPP:
+            ppm_out = []
+            for pool_scale in self.ppm:
+                ppm_out.append(pool_scale(conv5))
+
+        else:
+            conv5 = conv_out[-1]
+
+            input_size = conv5.size()
+            ppm_out = [conv5]
+            for pool_scale in self.ppm:
+                ppm_out.append(nn.functional.interpolate(
+                    pool_scale(conv5),
+                    (input_size[2], input_size[3]),
+                    mode='bilinear', align_corners=False))
+
+        ppm_out = torch.cat(ppm_out, 1)
+
+        x = self.conv_last(ppm_out)
+
+        if self.use_softmax:  # is True during inference  TODO: how do we need to modify this for classification?
+            x = nn.functional.interpolate(
+                x, size=segSize, mode='bilinear', align_corners=False)
+            x = nn.functional.softmax(x, dim=1)
+        else:
+            x = nn.functional.log_softmax(x, dim=1)  # transforms tensor to be in range [-inf, 0)
         return x
