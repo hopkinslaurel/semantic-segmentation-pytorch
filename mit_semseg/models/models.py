@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import numpy as np
 from . import resnet, resnext, mobilenet, hrnet
 from mit_semseg.lib.nn import SynchronizedBatchNorm2d
 BatchNorm2d = SynchronizedBatchNorm2d
@@ -19,11 +20,12 @@ class SegmentationModuleBase(nn.Module):
 
 
 class SegmentationModule(SegmentationModuleBase):
-    def __init__(self, net_enc, net_dec, crit, deep_sup_scale=None):
+    def __init__(self, net_enc, net_dec, crit, classes, deep_sup_scale=None):
         super(SegmentationModule, self).__init__()
         self.encoder = net_enc
         self.decoder = net_dec
         self.crit = crit
+        self.classes = classes
         self.deep_sup_scale = deep_sup_scale
 
     def forward(self, feed_dict, *, segSize=None):
@@ -34,13 +36,22 @@ class SegmentationModule(SegmentationModuleBase):
             else:
                 pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True))
 
-            loss = self.crit(pred, feed_dict['seg_label'])
-            if self.deep_sup_scale is not None:
-                loss_deepsup = self.crit(pred_deepsup, feed_dict['seg_label'])
-                loss = loss + loss_deepsup * self.deep_sup_scale
+            #print("Labels")
+            #print(str(feed_dict['seg_label']))
+            #print("Pred")
+            #print(pred)
 
-            acc = self.pixel_acc(pred, feed_dict['seg_label'])
-            return loss, acc
+            # this sums the loss for each class per example -- divide by the number of classes OR
+            #   remove "reduction =sum" from MSE to average across the classes
+            loss = self.crit(pred, feed_dict['seg_label'].type_as(pred))  # This returns the squared error for all examples, still need to divide by # examples to get MEAN squared error
+
+            loss = loss / pred.shape[0]  # now loss is mean squared error
+            #print("Loss: " +str (loss))
+            #acc = self.pixel_acc(pred, feed_dict['seg_label'])
+
+            #print("Final loss: " + str(loss))
+            return loss #, acc
+
         # inference
         else:
             pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True), segSize=segSize)
@@ -63,6 +74,7 @@ class ModelBuilder:
     @staticmethod
     def build_encoder(arch='resnet50dilated', fc_dim=512, weights=''):
         pretrained = True if len(weights) == 0 else False
+        print("Using pretrained model: " + str(pretrained))
         arch = arch.lower()
         if arch == 'mobilenetv2dilated':
             orig_mobilenet = mobilenet.__dict__['mobilenetv2'](pretrained=pretrained)
@@ -146,10 +158,9 @@ class ModelBuilder:
                 fc_dim=fc_dim,
                 use_softmax=use_softmax,
                 fpn_dim=512)
-
         # Classification models, not technically decoders
-        elif arch == 'ppm_classification':
-            net_decoder = PPM_classification(
+        elif arch == 'ppm_regression':
+            net_decoder = PPM_regression(
                 num_class=num_class,
                 fc_dim=fc_dim,
                 use_softmax=use_softmax)
@@ -599,77 +610,102 @@ class UPerNet(nn.Module):
 
 # Classification "decoders"
 # PPM with classification
-class PPM_classification(nn.Module):
+class PPM_regression(nn.Module):
     def __init__(self, num_class=150, fc_dim=4096,
                  use_softmax=False, pool_scales=(1, 2, 3, 6)):
-        super(PPM, self).__init__()
+        super(PPM_regression, self).__init__()
         self.use_softmax = use_softmax
 
         self.ppm = []
         for scale in pool_scales:
             self.ppm.append(nn.Sequential(
                 nn.AdaptiveAvgPool2d(scale),
-                nn.Conv2d(fc_dim, 512, kernel_size=1, bias=False),
-                BatchNorm2d(512),
+                nn.Conv2d(512, 256, kernel_size=1, bias=False),
+                BatchNorm2d(256),
                 nn.ReLU(inplace=True)
             ))
         self.ppm = nn.ModuleList(self.ppm)
 
-        print("pool_scales:")
-        print(pool_scales)
-        pp_features = [scale*512 for scale in pool_scales]
-        print(pp_features)
+        pp_features = [scale*scale*256 for scale in pool_scales]  # 12,800 TODO: how do we reduce this layer? More pooling?
         pp_features = np.sum(pp_features)
-        print(pp_features)
-        print(car)
+
+        #TODO: split into two classes, one with SPP and one without
+        spp = True
 
         # 1: fully connected composed of only the pyramid pooing layers, this is similar to Spatial
         #    Pyramid Pooling in Deep Convolutional Networks for Visual Recognition (page 3)
-        if SPP:
+        if spp:
             self.conv_last = nn.Sequential(
-                nn.Linear(pp_features, 512),
-                BatchNorm2d(512),
+                nn.Linear(pp_features, 1024),
+                BatchNorm2d(1024),
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(0.1),
+                nn.Linear(1024, num_class),
+                nn.ReLU(inplace=True)
             )
 
         # 2: conv feature maps AND upsampled pyramid pooing layers, this is similar to Pyramid Scene Parsing Network
         else:
             self.conv_last = nn.Sequential(
-                nn.Conv2d(fc_dim + len(pool_scales) * 512, 512,
+                nn.Conv2d(fc_dim + len(pool_scales) * 256, 256,
                           kernel_size=3, padding=1, bias=False),
-                BatchNorm2d(512),
+                BatchNorm2d(256),
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(0.1),
-                nn.Conv2d(512, num_class, kernel_size=1),  #TODO: experiment with removing this last convolution
+                nn.Conv2d(256, num_class, kernel_size=1),  #TODO: experiment with removing this last convolution
                 nn.Linear(4096 , num_class)  #TODO: 4096 is not correct, this will need to be tuned
             )
 
-    def forward(self, conv_out, segSize=None):
-        if SPP:
+    def forward(self, conv_out, segSize=None):  # conv_out are the output tensors from the forward pass through the encoder
+        spp=True
+
+        if spp:
+            conv5 = conv_out[-1]
+
             ppm_out = []
             for pool_scale in self.ppm:
-                ppm_out.append(pool_scale(conv5))
+                temp = pool_scale(conv5)
+                #print(temp.shape)
+                size = list(temp.shape)
+                temp = temp.reshape(size[0], size[1]*size[2]*size[3])  # [2, 512, 2, 2] --> [2, 2048] #TODO: verify this actually splits the tensors correctly
+                #print(temp.shape)
+                ppm_out.append(temp)
+
+            ppm_out = torch.cat(ppm_out, 1)  # [512, 1, 1]*4, [512, 2, 2]*4, [512, 3, 3]*4, [512, 6, 6]*4  -> [2, 25600], [2, 25600]
 
         else:
             conv5 = conv_out[-1]
 
             input_size = conv5.size()
-            ppm_out = [conv5]
+            ppm_out = [conv5]  # append scaled feature maps to the original set of feature maps
             for pool_scale in self.ppm:
+                # Performs SPP with given scales, and then bilinearly interpolates scaled feature maps to have the same
+                #    shape as the conv5 feature maps, in the ADE dataset case 38x38 and 38x50
                 ppm_out.append(nn.functional.interpolate(
                     pool_scale(conv5),
                     (input_size[2], input_size[3]),
                     mode='bilinear', align_corners=False))
 
-        ppm_out = torch.cat(ppm_out, 1)
+            #print("tensors in ppm_out")
+            #for item in ppm_out:
+                #for tensor in item:
+                    #print(tensor.shape)
+
+            ppm_out = torch.cat(ppm_out, 1)  #[2048, 38, 38]*2, [2048, 38, 50]*2, [512, 38,38]*8, [512, 38,50]*8  -> [2, 4096, 38, 38], [2, 4096, 38, 50]
+
+        #print("ppm_out")
+        #print(type(ppm_out))
+        #print(ppm_out.shape)
 
         x = self.conv_last(ppm_out)
 
-        if self.use_softmax:  # is True during inference  TODO: how do we need to modify this for classification?
+        #print(x.shape)
+        #print(x)
+
+        """if self.use_softmax:  # is True during inference  TODO: how do we need to modify this for classification?
             x = nn.functional.interpolate(
                 x, size=segSize, mode='bilinear', align_corners=False)
             x = nn.functional.softmax(x, dim=1)
         else:
-            x = nn.functional.log_softmax(x, dim=1)  # transforms tensor to be in range [-inf, 0)
+            x = nn.functional.log_softmax(x, dim=1)  # transforms tensor to be in range [-inf, 0)"""  # TODO: do we need a softmax layer?????
         return x

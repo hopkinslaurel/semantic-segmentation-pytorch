@@ -85,7 +85,9 @@ class TrainDataset(BaseDataset):
     def _get_sub_batch(self):
         while True:
             # get a sample record
-            this_sample = self.list_sample[self.cur_idx]
+            this_sample = self.list_sample[self.cur_idx]  # iterating over odgt file (text file)
+            #print("this_sample")
+            #print(this_sample)
             if this_sample['height'] > this_sample['width']:
                 self.batch_record_list[0].append(this_sample) # h > w, go to 1st class
             else:
@@ -200,6 +202,124 @@ class TrainDataset(BaseDataset):
 
     def __len__(self):
         return int(1e10) # It's a fake length due to the trick that every loader maintains its own list
+        #return self.num_sampleclass
+
+
+class TrainDatasetRegression(BaseDataset):
+    def __init__(self, root_dataset, odgt, classes, opt, batch_per_gpu=1, **kwargs):
+        super(TrainDatasetRegression, self).__init__(odgt, opt, **kwargs)
+        self.root_dataset = root_dataset
+        # down sampling rate of segm labe
+        self.segm_downsampling_rate = opt.segm_downsampling_rate
+        self.classes = classes
+        self.batch_per_gpu = batch_per_gpu
+
+        # classify images into two classes: 1. h > w and 2. h <= w
+        #self.batch_record_list = [[], []]
+        self.batch_record_list = []
+
+        # override dataset length when trainig with batch_per_gpu > 1
+        self.cur_idx = 0
+        self.if_shuffled = False
+
+    def _get_sub_batch(self):
+        while True:
+            # get a sample record
+            this_sample = self.list_sample[self.cur_idx]  # iterating over odgt file (text file)
+            self.batch_record_list.append(this_sample)
+
+            # update current sample pointer
+            self.cur_idx += 1
+            if self.cur_idx >= self.num_sample:
+                self.cur_idx = 0
+                np.random.shuffle(self.list_sample)
+
+            if len(self.batch_record_list) == self.batch_per_gpu:
+                batch_records = self.batch_record_list
+                self.batch_record_list = []
+                break
+
+        return batch_records
+
+    def __getitem__(self, index):
+        # NOTE: random shuffle for the first time. shuffle in __init__ is useless
+        if not self.if_shuffled:
+            np.random.seed(index)
+            np.random.shuffle(self.list_sample)
+            self.if_shuffled = True
+
+        # get sub-batch candidates
+        batch_records = self._get_sub_batch()
+
+        # resize all images' short edges to the chosen size
+        if isinstance(self.imgSizes, list) or isinstance(self.imgSizes, tuple):
+            this_short_size = np.random.choice(self.imgSizes)
+        else:
+            this_short_size = self.imgSizes
+        #this_short_size = self.imgSizes  # TODO: What do we need to do with this??
+
+        # calculate the BATCH's height and width
+        # since we concat more than one samples, the batch's h and w shall be larger than EACH sample
+        batch_widths = np.zeros(self.batch_per_gpu, np.int32)  # TODO: may be able to remove all of this -- but not sure
+        batch_heights = np.zeros(self.batch_per_gpu, np.int32)
+        for i in range(self.batch_per_gpu):
+            img_height, img_width = batch_records[i]['height'], batch_records[i]['width']
+            this_scale = min(
+                this_short_size / min(img_height, img_width), \
+                self.imgMaxSize / max(img_height, img_width))
+            batch_widths[i] = img_width * this_scale
+            batch_heights[i] = img_height * this_scale
+
+        # Here we must pad both input image and segmentation map to size h' and w' so that p | h' and p | w'
+        batch_width = np.max(batch_widths)
+        batch_height = np.max(batch_heights)
+        batch_width = int(self.round2nearest_multiple(batch_width, self.padding_constant))
+        batch_height = int(self.round2nearest_multiple(batch_height, self.padding_constant))
+
+        assert self.padding_constant >= self.segm_downsampling_rate, \
+            'padding constant must be equal or large than segm downsamping rate'
+        batch_images = torch.zeros(
+            self.batch_per_gpu, 3, batch_height, batch_width)
+        batch_segms = torch.zeros(self.batch_per_gpu, len(self.classes))
+
+        for i in range(self.batch_per_gpu):
+            this_record = batch_records[i]
+            #print(this_record)
+
+            # load image and label(s)
+            image_path = os.path.join(self.root_dataset, this_record['fpath_img'])
+            segm = np.zeros(len(self.classes))
+
+            j = 0
+            for c in self.classes:
+                segm[j] = (this_record[c])
+                j += 1
+            #print(segm)
+
+            img = Image.open(image_path).convert('RGB')   # can open tif images w/PIL
+
+            # random_flip
+            if np.random.choice([0, 1]):
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                #segm = segm.transpose(Image.FLIP_LEFT_RIGHT)
+
+            # note that each sample within a mini batch has different scale param
+            img = imresize(img, (batch_widths[i], batch_heights[i]), interp='bilinear')
+
+            # image transform, to torch float tensor 3xHxW
+            img = self.img_transform(img)
+
+            # put into batch arrays
+            batch_images[i][:, :img.shape[1], :img.shape[2]] = img
+            batch_segms[i] = torch.from_numpy(segm)
+
+        output = dict()
+        output['img_data'] = batch_images
+        output['seg_label'] = batch_segms
+        return output
+
+    def __len__(self):
+        return int(1e10)  # It's a fake length due to the trick that every loader maintains its own list
         #return self.num_sampleclass
 
 
