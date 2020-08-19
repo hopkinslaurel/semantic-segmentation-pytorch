@@ -1,3 +1,5 @@
+# Modifications made by Laurel Hopkins to instead perform multi-output regression
+
 # System libs
 import os
 import time
@@ -10,7 +12,7 @@ import torch
 import torch.nn as nn
 # Our libs
 from mit_semseg.config import cfg
-from mit_semseg.dataset import TrainDataset
+from mit_semseg.dataset import TrainDataset, TrainDatasetRegression
 from mit_semseg.models import ModelBuilder, SegmentationModule
 from mit_semseg.utils import AverageMeter, parse_devices, setup_logger
 from mit_semseg.lib.nn import UserScatteredDataParallel, user_scattered_collate, patch_replication_callback
@@ -21,7 +23,7 @@ def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     ave_total_loss = AverageMeter()
-    ave_acc = AverageMeter()
+    #ave_acc = AverageMeter()
 
     segmentation_module.train(not cfg.TRAIN.fix_bn)
 
@@ -30,6 +32,9 @@ def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
     for i in range(cfg.TRAIN.epoch_iters):
         # load a batch of data
         batch_data = next(iterator)
+        #print("Batch:")
+        #print(batch_data[0]['img_data'].shape)
+
         data_time.update(time.time() - tic)
         segmentation_module.zero_grad()
 
@@ -38,11 +43,12 @@ def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
         adjust_learning_rate(optimizers, cur_iter, cfg)
 
         # forward pass
-        loss, acc = segmentation_module(batch_data)
+        #print("Starting forward pass")
+        loss = segmentation_module(batch_data)
         loss = loss.mean()
-        acc = acc.mean()
 
         # Backward
+        #print("Starting backward pass")
         loss.backward()
         for optimizer in optimizers:
             optimizer.step()
@@ -53,22 +59,23 @@ def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
 
         # update average loss and acc
         ave_total_loss.update(loss.data.item())
-        ave_acc.update(acc.data.item()*100)
+        #ave_acc.update(acc.data.item()) #*100)  # TODO: uncomment after fixing acc in models.py
 
         # calculate accuracy, and display
         if i % cfg.TRAIN.disp_iter == 0:
             print('Epoch: [{}][{}/{}], Time: {:.2f}, Data: {:.2f}, '
                   'lr_encoder: {:.6f}, lr_decoder: {:.6f}, '
-                  'Accuracy: {:4.2f}, Loss: {:.6f}'
+                  'Loss: {:.6f}'   #'Accuracy: {:4.2f}, Loss: {:.6f}'
                   .format(epoch, i, cfg.TRAIN.epoch_iters,
                           batch_time.average(), data_time.average(),
                           cfg.TRAIN.running_lr_encoder, cfg.TRAIN.running_lr_decoder,
-                          ave_acc.average(), ave_total_loss.average()))
+                          #ave_acc.average(), ave_total_loss.average()))  # TODO: uncomment after fixing acc in models.py
+                          ave_total_loss.average()))  # TODO: uncomment after fixing acc in models.py
 
             fractional_epoch = epoch - 1 + 1. * i / cfg.TRAIN.epoch_iters
             history['train']['epoch'].append(fractional_epoch)
             history['train']['loss'].append(loss.data.item())
-            history['train']['acc'].append(acc.data.item())
+            #history['train']['acc'].append(acc.data.item())  # TODO: uncomment once acc is fixed in models.py
 
 
 def checkpoint(nets, history, cfg, epoch):
@@ -151,21 +158,40 @@ def main(cfg, gpus):
         num_class=cfg.DATASET.num_class,
         weights=cfg.MODEL.weights_decoder)
 
-    crit = nn.NLLLoss(ignore_index=-1)
+    if cfg.MODEL.arch_decoder.endswith('regression'):
+        crit = nn.MSELoss(reduction="sum")  # Sum for multi-output learning, need to sum across all labels
+    else:
+        crit = nn.NLLLoss(ignore_index=-1)  # negative log likelihood loss
 
     if cfg.MODEL.arch_decoder.endswith('deepsup'):
         segmentation_module = SegmentationModule(
-            net_encoder, net_decoder, crit, cfg.TRAIN.deep_sup_scale)
+            net_encoder, net_decoder, crit, cfg.DATASET.classes, cfg.TRAIN.deep_sup_scale)
     else:
         segmentation_module = SegmentationModule(
-            net_encoder, net_decoder, crit)
+            net_encoder, net_decoder, crit, cfg.DATASET.classes)
+
+    print("net_encoder")
+    print(type(net_encoder))
+    print(net_encoder)
+    print("net_decoder")
+    print(type(net_decoder))
+    print(net_decoder)
 
     # Dataset and Loader
-    dataset_train = TrainDataset(
-        cfg.DATASET.root_dataset,
-        cfg.DATASET.list_train,
-        cfg.DATASET,
-        batch_per_gpu=cfg.TRAIN.batch_size_per_gpu)
+    if cfg.MODEL.arch_decoder.endswith('regression'):
+        print("performing regression")
+        dataset_train = TrainDatasetRegression(
+            cfg.DATASET.root_dataset,
+            cfg.DATASET.list_train,
+            cfg.DATASET.classes,
+            cfg.DATASET,
+            batch_per_gpu=cfg.TRAIN.batch_size_per_gpu)
+    else:
+        dataset_train = TrainDataset(
+            cfg.DATASET.root_dataset,
+            cfg.DATASET.list_train,
+            cfg.DATASET,
+            batch_per_gpu=cfg.TRAIN.batch_size_per_gpu)
 
     loader_train = torch.utils.data.DataLoader(
         dataset_train,
@@ -194,12 +220,14 @@ def main(cfg, gpus):
     optimizers = create_optimizers(nets, cfg)
 
     # Main loop
-    history = {'train': {'epoch': [], 'loss': [], 'acc': []}}
+    #history = {'train': {'epoch': [], 'loss': [], 'acc': []}}
+    history = {'train': {'epoch': [], 'loss': []}}
 
     for epoch in range(cfg.TRAIN.start_epoch, cfg.TRAIN.num_epoch):
         train(segmentation_module, iterator_train, optimizers, history, epoch+1, cfg)
 
-        # checkpointing
+        # checkpointing every 5th epoch
+        #if (epoch % 5 == 0):
         checkpoint(nets, history, cfg, epoch+1)
 
     print('Training Done!')
@@ -221,7 +249,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         "--gpus",
-        default="0-3",
+        default="0-1",
         help="gpus to use, e.g. 0-3 or 0,1,2,3"
     )
     parser.add_argument(
@@ -236,7 +264,7 @@ if __name__ == '__main__':
     cfg.merge_from_list(args.opts)
     # cfg.freeze()
 
-    logger = setup_logger(distributed_rank=0)   # TODO
+    logger = setup_logger(distributed_rank=0)
     logger.info("Loaded configuration file {}".format(args.cfg))
     logger.info("Running with config:\n{}".format(cfg))
 
