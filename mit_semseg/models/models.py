@@ -28,7 +28,7 @@ class SegmentationModule(SegmentationModuleBase):
         self.classes = classes
         self.deep_sup_scale = deep_sup_scale
 
-    def forward(self, feed_dict, *, segSize=None):
+    def forward(self, feed_dict, *, segSize=None, extract=False):
         # training
         if segSize is None:
             if self.deep_sup_scale is not None: # use deep supervision technique
@@ -54,8 +54,12 @@ class SegmentationModule(SegmentationModuleBase):
 
         # inference
         else:
-            pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True), segSize=segSize)
-            return pred
+            if extract:
+                embedding = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True))
+                return embedding
+            else:
+                pred = self.decoder(self.encoder(feed_dict['img_data'], return_feature_maps=True), segSize=segSize)
+                return pred
 
 
 class ModelBuilder:
@@ -164,6 +168,11 @@ class ModelBuilder:
                 num_class=num_class,
                 fc_dim=fc_dim,
                 use_softmax=use_softmax)
+        elif arch == 'ppm_regression_extract':
+            net_decoder = PPM_regression_extract(
+                num_class=num_class,
+                fc_dim=fc_dim,
+                use_softmax=use_softmax)
         else:
             raise Exception('Architecture undefined!')
 
@@ -268,7 +277,7 @@ class ResnetDilated(nn.Module):
                     m.dilation = (dilate, dilate)
                     m.padding = (dilate, dilate)
 
-    def forward(self, x, return_feature_maps=False):
+    def forward(self, x, return_feature_maps=False, extract=False):
         conv_out = []
 
         x = self.relu1(self.bn1(self.conv1(x)))
@@ -429,7 +438,7 @@ class PPM(nn.Module):
             nn.Conv2d(512, num_class, kernel_size=1)
         )
 
-    def forward(self, conv_out, segSize=None):
+    def forward(self, conv_out, segSize=None, extract=False):
         conv5 = conv_out[-1]
 
         input_size = conv5.size()
@@ -620,17 +629,17 @@ class PPM_regression(nn.Module):
         for scale in pool_scales:
             self.ppm.append(nn.Sequential(
                 nn.AdaptiveAvgPool2d(scale),
-                nn.Conv2d(512, 256, kernel_size=1, bias=False),
-                BatchNorm2d(256),
+                nn.Conv2d(512, 128, kernel_size=1, bias=False),
+                BatchNorm2d(128),
                 nn.ReLU(inplace=True)
             ))
         self.ppm = nn.ModuleList(self.ppm)
 
-        pp_features = [scale*scale*256 for scale in pool_scales]  # 12,800 TODO: how do we reduce this layer? More pooling?
+        pp_features = [scale*scale*128 for scale in pool_scales]  # 12,800 TODO: how do we reduce this layer? More pooling?
         pp_features = np.sum(pp_features)
 
         #TODO: split into two classes, one with SPP and one without
-        spp = True
+        spp = False
 
         # 1: fully connected composed of only the pyramid pooing layers, this is similar to Spatial
         #    Pyramid Pooling in Deep Convolutional Networks for Visual Recognition (page 3)
@@ -641,23 +650,50 @@ class PPM_regression(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Dropout2d(0.1),
                 nn.Linear(1024, num_class),
-                nn.ReLU(inplace=True)
+                nn.ReLU(inplace=True)  # TODO: Why is this here??
             )
 
         # 2: conv feature maps AND upsampled pyramid pooing layers, this is similar to Pyramid Scene Parsing Network
         else:
-            self.conv_last = nn.Sequential(
-                nn.Conv2d(fc_dim + len(pool_scales) * 256, 256,
+            self.conv_2nd_last = nn.Sequential(
+                #nn.Conv2d(fc_dim + len(pool_scales) * 256, 256,
+                #         kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(128*len(pool_scales) + 512, 256,  # TODO: is 512 too small?
                           kernel_size=3, padding=1, bias=False),
                 BatchNorm2d(256),
                 nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((45, 64)), # THIS SIZE SHOULD BE TUNED FOR DIFFERENT SIZED INPUTS
+                nn.Conv2d(256, 64, kernel_size=3, padding=1, bias=False),  #TODO: 128 right size?
+                BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 16, kernel_size=3, padding=1, bias=False),  # TODO: 128 right size?
+                BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.AvgPool2d(2)
+            )
+            self.conv_last = nn.Sequential(
                 nn.Dropout2d(0.1),
-                nn.Conv2d(256, num_class, kernel_size=1),  #TODO: experiment with removing this last convolution
-                nn.Linear(4096 , num_class)  #TODO: 4096 is not correct, this will need to be tuned
+                nn.Linear(11264 , 2816),
+                BatchNorm2d(2816),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(2816, 512),
+                BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(512, 128),
+                BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(128, 32),
+                BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(32, num_class)
             )
 
     def forward(self, conv_out, segSize=None):  # conv_out are the output tensors from the forward pass through the encoder
-        spp=True
+        spp=False
 
         if spp:
             conv5 = conv_out[-1]
@@ -678,6 +714,7 @@ class PPM_regression(nn.Module):
 
             input_size = conv5.size()
             ppm_out = [conv5]  # append scaled feature maps to the original set of feature maps
+
             for pool_scale in self.ppm:
                 # Performs SPP with given scales, and then bilinearly interpolates scaled feature maps to have the same
                 #    shape as the conv5 feature maps, in the ADE dataset case 38x38 and 38x50
@@ -686,18 +723,142 @@ class PPM_regression(nn.Module):
                     (input_size[2], input_size[3]),
                     mode='bilinear', align_corners=False))
 
-            #print("tensors in ppm_out")
-            #for item in ppm_out:
-                #for tensor in item:
-                    #print(tensor.shape)
+                                             # [imgs_per_batch, channels, img_x, img_y]
+            ppm_out = torch.cat(ppm_out, 1)  # [[18, 512, 66, 94], [18, 256, 66, 94], [18, 256, 66, 94], [18, 256, 66, 94], [18, 256, 66, 94]]
+                                             # --> [[1536, 66, 94], ....] length 18)
 
-            ppm_out = torch.cat(ppm_out, 1)  #[2048, 38, 38]*2, [2048, 38, 50]*2, [512, 38,38]*8, [512, 38,50]*8  -> [2, 4096, 38, 38], [2, 4096, 38, 50]
+        x = self.conv_2nd_last(ppm_out)
+        f = nn.Flatten()
+        x = f(x)
+        x = self.conv_last(x)
+        
+        """if self.use_softmax:  # is True during inference  TODO: how do we need to modify this for classification?
+            x = nn.functional.interpolate(
+                x, size=segSize, mode='bilinear', align_corners=False)
+            x = nn.functional.softmax(x, dim=1)
+        else:
+            x = nn.functional.log_softmax(x, dim=1)  # transforms tensor to be in range [-inf, 0)"""  # TODO: do we need a softmax layer?????
+        return x
+
+# PPM with classification
+class PPM_regression_extract(nn.Module):
+    def __init__(self, num_class=150, fc_dim=4096,
+                 use_softmax=False, pool_scales=(1, 2, 3, 6)):
+        super(PPM_regression_extract, self).__init__()
+        self.use_softmax = use_softmax
+
+        self.ppm = []
+        for scale in pool_scales:
+            self.ppm.append(nn.Sequential(
+                nn.AdaptiveAvgPool2d(scale),
+                nn.Conv2d(512, 128, kernel_size=1, bias=False),  #spp=True, 256 rather than 128
+                BatchNorm2d(128),  #256
+                nn.ReLU(inplace=True)
+            ))
+        self.ppm = nn.ModuleList(self.ppm)
+
+        pp_features = [scale*scale*128 for scale in pool_scales]  # 12,800 TODO: how do we reduce this layer? More pooling?
+        pp_features = np.sum(pp_features)
+
+        #TODO: split into two classes, one with SPP and one without
+        spp = False
+
+        # 1: fully connected composed of only the pyramid pooing layers, this is similar to Spatial
+        #    Pyramid Pooling in Deep Convolutional Networks for Visual Recognition (page 3)
+        if spp:
+            #self.conv_last = nn.Linear(pp_features, 1024) # TODO: rerun extraction for this
+            self.conv_last = nn.Sequential(
+                nn.Linear(pp_features, 1024),
+                BatchNorm2d(1024),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(1024, num_class),
+                nn.ReLU(inplace=True)  # TODO: Why is this here??
+            )
+
+        # 2: conv feature maps AND upsampled pyramid pooing layers, this is similar to Pyramid Scene Parsing Network
+        else:
+            self.conv_2nd_last = nn.Sequential(
+                # nn.Conv2d(fc_dim + len(pool_scales) * 256, 256,
+                #         kernel_size=3, padding=1, bias=False),
+                nn.Conv2d(128 * len(pool_scales) + 512, 256,  # TODO: is 512 too small?
+                          kernel_size=3, padding=1, bias=False),
+                BatchNorm2d(256),
+                nn.ReLU(inplace=True),
+                nn.AdaptiveAvgPool2d((45, 64)),  # THIS SIZE SHOULD BE TUNED FOR DIFFERENT SIZED INPUTS
+                nn.Conv2d(256, 64, kernel_size=3, padding=1, bias=False),  # TODO: 128 right size?
+                BatchNorm2d(64),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(64, 16, kernel_size=3, padding=1, bias=False),  # TODO: 128 right size?
+                BatchNorm2d(16),
+                nn.ReLU(inplace=True),
+                nn.AvgPool2d(2)
+            )
+            self.conv_last = nn.Sequential(
+                nn.Dropout2d(0.1),
+                nn.Linear(11264, 2816),
+                BatchNorm2d(2816),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(2816, 512),
+                BatchNorm2d(512),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(512, 128),
+                BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Dropout2d(0.1),
+                nn.Linear(128, 32),
+                BatchNorm2d(32),
+                nn.ReLU(inplace=True),
+                #nn.Dropout2d(0.1),
+                #nn.Linear(32, num_class)
+            )
+
+    def forward(self, conv_out, segSize=None):  # conv_out are the output tensors from the forward pass through the encoder
+        spp=False
+
+        if spp:
+            conv5 = conv_out[-1]
+
+            ppm_out = []
+            for pool_scale in self.ppm:
+                temp = pool_scale(conv5)
+                #print(temp.shape)
+                size = list(temp.shape)
+                temp = temp.reshape(size[0], size[1]*size[2]*size[3])  # [2, 512, 2, 2] --> [2, 2048] #TODO: verify this actually splits the tensors correctly
+                #print(temp.shape)
+                ppm_out.append(temp)
+
+            ppm_out = torch.cat(ppm_out, 1)  # [512, 1, 1]*4, [512, 2, 2]*4, [512, 3, 3]*4, [512, 6, 6]*4  -> [2, 25600], [2, 25600]
+
+            x = self.conv_last(ppm_out)
+
+        else:
+            conv5 = conv_out[-1]
+
+            input_size = conv5.size()
+            ppm_out = [conv5]  # append scaled feature maps to the original set of feature maps
+
+            for pool_scale in self.ppm:
+                # Performs SPP with given scales, and then bilinearly interpolates scaled feature maps to have the same
+                #    shape as the conv5 feature maps, in the ADE dataset case 38x38 and 38x50
+                ppm_out.append(nn.functional.interpolate(
+                    pool_scale(conv5),
+                    (input_size[2], input_size[3]),
+                    mode='bilinear', align_corners=False))
+
+                                             # [imgs_per_batch, channels, img_x, img_y]
+            ppm_out = torch.cat(ppm_out, 1)  # [[18, 512, 66, 94], [18, 256, 66, 94], [18, 256, 66, 94], [18, 256, 66, 94], [18, 256, 66, 94]]
+                                             # --> [[1536, 66, 94]
+            x = self.conv_2nd_last(ppm_out)
+            f = nn.Flatten()
+            x = f(x)
+            x = self.conv_last(x)
 
         #print("ppm_out")
         #print(type(ppm_out))
         #print(ppm_out.shape)
-
-        x = self.conv_last(ppm_out)
 
         #print(x.shape)
         #print(x)

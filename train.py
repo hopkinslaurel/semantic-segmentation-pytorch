@@ -75,7 +75,65 @@ def train(segmentation_module, iterator, optimizers, history, epoch, cfg):
             fractional_epoch = epoch - 1 + 1. * i / cfg.TRAIN.epoch_iters
             history['train']['epoch'].append(fractional_epoch)
             history['train']['loss'].append(loss.data.item())
-            #history['train']['acc'].append(acc.data.item())  # TODO: uncomment once acc is fixed in models.py
+
+    train_out = open("train_" + cfg.MODEL.arch_encoder + "_" + cfg.MODEL.arch_decoder + ".txt", "a")
+    train_out.write(str(ave_total_loss.average()) + "\n")
+    train_out.close()
+
+
+# val
+def val(segmentation_module, iterator, optimizers, history, epoch, cfg):
+    #batch_time = AverageMeter()
+    #data_time = AverageMeter()
+    ave_total_val_loss = AverageMeter()
+    #ave_acc = AverageMeter()
+
+    #segmentation_module.train(not cfg.TRAIN.fix_bn)
+    segmentation_module.eval()
+
+
+    # main loop
+    #tic = time.time()
+    for i in range(cfg.VAL.epoch_iters):
+        # load a batch of data
+        batch_data = next(iterator)
+        #print("Batch:")
+        #print(batch_data[0]['img_data'].shape)
+
+        #data_time.update(time.time() - tic)
+        #segmentation_module.zero_grad()
+
+        with torch.no_grad():
+            loss = segmentation_module(batch_data)
+            loss = loss.mean()
+
+        # Backward
+        #print("Starting backward pass")
+        #loss.backward()
+        #for optimizer in optimizers:
+        #    optimizer.step()
+
+        # measure elapsed time
+        #batch_time.update(time.time() - tic)
+        #tic = time.time()
+
+        # update average loss and acc
+        ave_total_val_loss.update(loss.data.item())
+
+        # calculate accuracy, and display
+        if i % cfg.VAL.disp_iter == 0:
+            print('Epoch: [{}][{}/{}], '
+                  'Val loss: {:.6f}'
+                  .format(epoch, i, cfg.VAL.epoch_iters,
+                          ave_total_val_loss.average()))
+
+            fractional_epoch = epoch - 1 + 1. * i / cfg.VAL.epoch_iters
+            history['val']['epoch'].append(fractional_epoch)
+            history['val']['loss'].append(loss.data.item())
+
+    val_out = open("val_" + cfg.MODEL.arch_encoder + "_" + cfg.MODEL.arch_decoder + ".txt", "a")
+    val_out.write(str(ave_total_val_loss.average()) + "\n")
+    val_out.close()
 
 
 def checkpoint(nets, history, cfg, epoch):
@@ -138,6 +196,8 @@ def adjust_learning_rate(optimizers, cur_iter, cfg):
     scale_running_lr = ((1. - float(cur_iter) / cfg.TRAIN.max_iters) ** cfg.TRAIN.lr_pow)
     cfg.TRAIN.running_lr_encoder = cfg.TRAIN.lr_encoder * scale_running_lr
     cfg.TRAIN.running_lr_decoder = cfg.TRAIN.lr_decoder * scale_running_lr
+    #print("lr_encoder: " + str(cfg.TRAIN.running_lr_encoder))
+    #print("lr_decoder: " + str(cfg.TRAIN.running_lr_decoder))
 
     (optimizer_encoder, optimizer_decoder) = optimizers
     for param_group in optimizer_encoder.param_groups:
@@ -186,6 +246,13 @@ def main(cfg, gpus):
             cfg.DATASET.classes,
             cfg.DATASET,
             batch_per_gpu=cfg.TRAIN.batch_size_per_gpu)
+
+        dataset_val = TrainDatasetRegression(
+            cfg.DATASET.root_dataset,
+            cfg.DATASET.list_val,
+            cfg.DATASET.classes,
+            cfg.DATASET,
+            batch_per_gpu=cfg.TRAIN.batch_size_per_gpu)
     else:
         dataset_train = TrainDataset(
             cfg.DATASET.root_dataset,
@@ -201,10 +268,19 @@ def main(cfg, gpus):
         num_workers=cfg.TRAIN.workers,
         drop_last=True,
         pin_memory=True)
+    loader_val = torch.utils.data.DataLoader(
+        dataset_val,
+        batch_size=len(gpus),  # we have modified data_parallel
+        shuffle=False,  # we do not use this param
+        collate_fn=user_scattered_collate,
+        num_workers=cfg.TRAIN.workers,
+        drop_last=True,
+        pin_memory=True)
     print('1 Epoch = {} iters'.format(cfg.TRAIN.epoch_iters))
 
     # create loader iterator
     iterator_train = iter(loader_train)
+    iterator_val = iter(loader_val)
 
     # load nets into gpu
     if len(gpus) > 1:
@@ -220,15 +296,16 @@ def main(cfg, gpus):
     optimizers = create_optimizers(nets, cfg)
 
     # Main loop
-    #history = {'train': {'epoch': [], 'loss': [], 'acc': []}}
-    history = {'train': {'epoch': [], 'loss': []}}
+    history = {'train': {'epoch': [], 'loss': []}, 'val': {'epoch': [], 'loss': []}}
 
     for epoch in range(cfg.TRAIN.start_epoch, cfg.TRAIN.num_epoch):
         train(segmentation_module, iterator_train, optimizers, history, epoch+1, cfg)
+        val(segmentation_module, iterator_val, optimizers, history, epoch+1, cfg)
 
         # checkpointing every 5th epoch
-        #if (epoch % 5 == 0):
-        checkpoint(nets, history, cfg, epoch+1)
+        if (epoch % 5 == 0):
+            checkpoint(nets, history, cfg, epoch+1)
+
 
     print('Training Done!')
 
@@ -282,7 +359,7 @@ if __name__ == '__main__':
         cfg.MODEL.weights_decoder = os.path.join(
             cfg.DIR, 'decoder_epoch_{}.pth'.format(cfg.TRAIN.start_epoch))
         assert os.path.exists(cfg.MODEL.weights_encoder) and \
-            os.path.exists(cfg.MODEL.weights_decoder), "checkpoint does not exitst!"
+            os.path.exists(cfg.MODEL.weights_decoder), "checkpoint does not exist!"
 
     # Parse gpu ids
     gpus = parse_devices(args.gpus)

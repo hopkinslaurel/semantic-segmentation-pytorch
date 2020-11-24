@@ -12,8 +12,9 @@ _C.DIR = "ckpt/ade20k-resnet50dilated-ppm_deepsup"
 # -----------------------------------------------------------------------------
 _C.DATASET = CN()
 _C.DATASET.root_dataset = "./data/"
-_C.DATASET.list_train = "./data/training.odgt"
-_C.DATASET.list_val = "./data/validation.odgt"
+_C.DATASET.list_train = "./data/train.odgt"
+_C.DATASET.list_val = "./data/val.odgt"
+_C.DATASET.list_test = "./data/test.odgt"
 _C.DATASET.num_class = 150
 _C.DATASET.classes = []
 # multiscale train/test, size of short edge (int or tuple)
@@ -85,6 +86,10 @@ _C.VAL.batch_size = 1
 _C.VAL.visualize = False
 # the checkpoint to evaluate on
 _C.VAL.checkpoint = "epoch_20.pth"
+# iterations of each epoch (irrelevant to batch size)
+_C.VAL.epoch_iters = 5000
+# frequency to display
+_C.VAL.disp_iter = 20
 
 # -----------------------------------------------------------------------------
 # Testing

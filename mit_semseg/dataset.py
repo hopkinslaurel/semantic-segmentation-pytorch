@@ -332,12 +332,12 @@ class ValDataset(BaseDataset):
         this_record = self.list_sample[index]
         # load image and label
         image_path = os.path.join(self.root_dataset, this_record['fpath_img'])
-        segm_path = os.path.join(self.root_dataset, this_record['fpath_segm'])
+        #segm_path = os.path.join(self.root_dataset, this_record['fpath_segm'])
         img = Image.open(image_path).convert('RGB')
-        segm = Image.open(segm_path)
-        assert(segm.mode == "L")
-        assert(img.size[0] == segm.size[0])
-        assert(img.size[1] == segm.size[1])
+        #segm = Image.open(segm_path)
+        #assert(segm.mode == "L")
+        #assert(img.size[0] == segm.size[0])
+        #assert(img.size[1] == segm.size[1])
 
         ori_width, ori_height = img.size
 
@@ -361,13 +361,13 @@ class ValDataset(BaseDataset):
             img_resized_list.append(img_resized)
 
         # segm transform, to torch long tensor HxW
-        segm = self.segm_transform(segm)
-        batch_segms = torch.unsqueeze(segm, 0)
+        #segm = self.segm_transform(segm)
+        #batch_segms = torch.unsqueeze(segm, 0)
 
         output = dict()
         output['img_ori'] = np.array(img)
         output['img_data'] = [x.contiguous() for x in img_resized_list]
-        output['seg_label'] = batch_segms.contiguous()
+        #output['seg_label'] = batch_segms.contiguous()
         output['info'] = this_record['fpath_img']
         return output
 
